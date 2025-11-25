@@ -30,6 +30,61 @@ const CONSTANTS = {
   LCV: 41000,
 };
 
+// ==========================================
+// ADAPTERS (Infrastructure Layer)
+// ==========================================
+
+// Switch this to false to use the real backend
+const USE_MOCK = false;
+
+const MockAPI = {
+  routes: [
+    { id: 1, routeId: 'R001', vesselType: 'Container', fuelType: 'HFO', year: 2024, ghgIntensity: 91.0, fuelConsumption: 5000, distance: 12000, totalEmissions: 4500, isBaseline: false },
+    { id: 2, routeId: 'R002', vesselType: 'BulkCarrier', fuelType: 'LNG', year: 2024, ghgIntensity: 88.0, fuelConsumption: 4800, distance: 11500, totalEmissions: 4200, isBaseline: true },
+    { id: 3, routeId: 'R003', vesselType: 'Tanker', fuelType: 'MGO', year: 2024, ghgIntensity: 93.5, fuelConsumption: 5100, distance: 12500, totalEmissions: 4700, isBaseline: false },
+    { id: 4, routeId: 'R004', vesselType: 'RoRo', fuelType: 'HFO', year: 2025, ghgIntensity: 89.2, fuelConsumption: 4900, distance: 11800, totalEmissions: 4300, isBaseline: false },
+    { id: 5, routeId: 'R005', vesselType: 'Container', fuelType: 'LNG', year: 2025, ghgIntensity: 90.5, fuelConsumption: 4950, distance: 11900, totalEmissions: 4400, isBaseline: false }
+  ],
+  bankEntries: [] as any[],
+
+  async getRoutes() {
+    return new Promise<Route[]>(resolve => setTimeout(() => resolve([...this.routes]), 500));
+  },
+
+  async setBaseline(id: number) {
+    this.routes = this.routes.map(r => ({ ...r, isBaseline: r.id === id }));
+    return Promise.resolve();
+  },
+
+  async getCompliance(routeId: string) {
+    const route = this.routes.find(r => r.routeId === routeId);
+    if (!route) throw new Error("Route not found");
+    
+    const energyInScope = route.fuelConsumption * CONSTANTS.LCV;
+    const cb = (CONSTANTS.GHG_TARGET_2025 - route.ghgIntensity) * energyInScope;
+    const banked = this.bankEntries.filter(e => e.routeId === routeId && e.type === 'banked')
+                    .reduce((acc, cur) => acc + cur.amount, 0);
+    const applied = this.bankEntries.filter(e => e.routeId === routeId && e.type === 'applied')
+                    .reduce((acc, cur) => acc + cur.amount, 0);
+    
+    return { cb, banked: banked - applied, adjustedCB: cb + banked - applied };
+  },
+
+  async bankSurplus(routeId: string, amount: number) {
+    this.bankEntries.push({ routeId, type: 'banked', amount, date: new Date() });
+    return Promise.resolve();
+  },
+
+  async applyBanked(routeId: string, amount: number) {
+    this.bankEntries.push({ routeId, type: 'applied', amount, date: new Date() });
+    return Promise.resolve();
+  }
+};
+
+// ==========================================
+// UI COMPONENTS
+// ==========================================
+
 const Header = ({ totalRoutes, compliantCount }: { totalRoutes: number, compliantCount: number }) => (
   <header className="bg-white border-b border-gray-200 pb-6 pt-6 px-6 shadow-sm">
     <div className="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
