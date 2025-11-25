@@ -2,6 +2,196 @@ import express, { Request, Response } from 'express';
 import { Pool } from 'pg';
 import cors from 'cors';
 
+// ==========================================
+// CORE: DOMAIN (No Framework Dependencies)
+// ==========================================
+
+// Domain Entities
+export interface Route {
+    id: number;
+    routeId: string;
+    vesselType: string;
+    fuelType: string;
+    year: number;
+    ghgIntensity: number;
+    fuelConsumption: number;
+    distance: number;
+    totalEmissions: number;
+    isBaseline: boolean;
+}
+
+export interface BankEntry {
+    id?: number;
+    routeId: string;
+    year: number;
+    type: 'banked' | 'applied';
+    amount: number;
+    createdAt?: Date;
+}
+
+export interface ComplianceResult {
+    cb: number;
+    banked: number;
+    adjustedCB: number;
+}
+
+export const CONSTANTS = {
+    GHG_TARGET_2025: 89.3368,
+    LCV: 41000, // MJ/t
+};
+
+// Domain Logic (Use Cases)
+export class ComplianceService {
+    constructor(
+        private routeRepo: RouteRepositoryPort,
+        private bankingRepo: BankingRepositoryPort
+    ) {}
+
+    async calculateCB(routeId: string, year: number): Promise<ComplianceResult> {
+        const route = await this.routeRepo.findByRouteId(routeId);
+        if (!route) throw new Error('Route not found');
+
+        // Core Formula: CB = (Target - Actual) * Energy
+        const energyInScope = route.fuelConsumption * CONSTANTS.LCV;
+        const cb = (CONSTANTS.GHG_TARGET_2025 - route.ghgIntensity) * energyInScope;
+
+        const bankEntries = await this.bankingRepo.findByRouteId(routeId);
+        const bankedSum = bankEntries
+            .filter(e => e.type === 'banked')
+            .reduce((sum, e) => sum + Number(e.amount), 0);
+        const appliedSum = bankEntries
+            .filter(e => e.type === 'applied')
+            .reduce((sum, e) => sum + Number(e.amount), 0);
+
+        const netBanked = bankedSum - appliedSum;
+
+        return {
+            cb,
+            banked: netBanked,
+            adjustedCB: cb + netBanked
+        };
+    }
+
+    async bankSurplus(routeId: string, year: number): Promise<BankEntry> {
+        const status = await this.calculateCB(routeId, year);
+        if (status.cb <= 0) throw new Error('Cannot bank negative compliance balance');
+
+        const entry: BankEntry = {
+            routeId,
+            year,
+            type: 'banked',
+            amount: status.cb
+        };
+        return await this.bankingRepo.save(entry);
+    }
+}
+
+// ==========================================
+// PORTS (Interfaces)
+// ==========================================
+
+export interface RouteRepositoryPort {
+    findAll(): Promise<Route[]>;
+    findByRouteId(id: string): Promise<Route | null>;
+    setBaseline(id: number): Promise<void>;
+    getBaseline(year: number): Promise<Route | null>;
+}
+
+export interface BankingRepositoryPort {
+    findByRouteId(id: string): Promise<BankEntry[]>;
+    save(entry: BankEntry): Promise<BankEntry>;
+}
+
+// ==========================================
+// ADAPTERS: INFRASTRUCTURE (Postgres)
+// ==========================================
+
+class PostgresRouteAdapter implements RouteRepositoryPort {
+    constructor(private db: Pool) {}
+
+    async findAll(): Promise<Route[]> {
+        const res = await this.db.query('SELECT * FROM routes ORDER BY route_id');
+        return res.rows.map(this.mapRowToRoute);
+    }
+
+    async findByRouteId(id: string): Promise<Route | null> {
+        const res = await this.db.query('SELECT * FROM routes WHERE route_id = $1', [id]);
+        return res.rows.length ? this.mapRowToRoute(res.rows[0]) : null;
+    }
+
+    async setBaseline(id: number): Promise<void> {
+        // Transaction to ensure only one baseline per year
+        const client = await this.db.connect();
+        try {
+            await client.query('BEGIN');
+            // Get year of the requested route
+            const routeRes = await client.query('SELECT year FROM routes WHERE id = $1', [id]);
+            if (routeRes.rows.length === 0) throw new Error('Route not found');
+            
+            const year = routeRes.rows[0].year;
+            
+            // Reset others in same year
+            await client.query('UPDATE routes SET is_baseline = FALSE WHERE year = $1', [year]);
+            // Set new baseline
+            await client.query('UPDATE routes SET is_baseline = TRUE WHERE id = $1', [id]);
+            await client.query('COMMIT');
+        } catch (e) {
+            await client.query('ROLLBACK');
+            throw e;
+        } finally {
+            client.release();
+        }
+    }
+
+    async getBaseline(year: number): Promise<Route | null> {
+        const res = await this.db.query('SELECT * FROM routes WHERE is_baseline = TRUE AND year = $1', [year]);
+        return res.rows.length ? this.mapRowToRoute(res.rows[0]) : null;
+    }
+
+    private mapRowToRoute(row: any): Route {
+        return {
+            id: row.id,
+            routeId: row.route_id,
+            vesselType: row.vessel_type,
+            fuelType: row.fuel_type,
+            year: row.year,
+            ghgIntensity: parseFloat(row.ghg_intensity),
+            fuelConsumption: parseFloat(row.fuel_consumption),
+            distance: parseFloat(row.distance),
+            totalEmissions: parseFloat(row.total_emissions),
+            isBaseline: row.is_baseline
+        };
+    }
+}
+
+class PostgresBankingAdapter implements BankingRepositoryPort {
+    constructor(private db: Pool) {}
+
+    async findByRouteId(id: string): Promise<BankEntry[]> {
+        const res = await this.db.query('SELECT * FROM bank_entries WHERE route_id = $1', [id]);
+        return res.rows.map(row => ({
+            id: row.id,
+            routeId: row.route_id,
+            year: row.year,
+            type: row.type,
+            amount: parseFloat(row.amount_gco2eq),
+            createdAt: row.created_at
+        }));
+    }
+
+    async save(entry: BankEntry): Promise<BankEntry> {
+        const res = await this.db.query(
+            'INSERT INTO bank_entries (route_id, year, type, amount_gco2eq) VALUES ($1, $2, $3, $4) RETURNING *',
+            [entry.routeId, entry.year, entry.type, entry.amount]
+        );
+        return res.rows[0];
+    }
+}
+
+// ==========================================
+// ADAPTERS: UI (Express API)
+// ==========================================
+
 const app = express();
 app.use(cors());
 app.use(express.json());
