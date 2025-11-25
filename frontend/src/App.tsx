@@ -81,6 +81,18 @@ const MockAPI = {
   }
 };
 
+// Real API Adapter (to be used when backend is running)
+const RealAPI = {
+  baseUrl: 'http://localhost:3000',
+  async getRoutes() { return fetch(`${this.baseUrl}/routes`).then(r => r.json()); },
+  async setBaseline(id: number) { return fetch(`${this.baseUrl}/routes/${id}/baseline`, { method: 'POST' }).then(r => r.json()); },
+  async getCompliance(routeId: string, year: number = 2025) { return fetch(`${this.baseUrl}/compliance/cb?routeId=${routeId}&year=${year}`).then(r => r.json()); },
+  async bankSurplus(routeId: string, year: number) { return fetch(`${this.baseUrl}/banking/bank`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({routeId, year})}).then(r => r.json()); },
+  async applyBanked(routeId: string, amount: number) { return Promise.resolve(); } // Placeholder
+};
+
+const api = USE_MOCK ? MockAPI : RealAPI;
+
 // ==========================================
 // UI COMPONENTS
 // ==========================================
